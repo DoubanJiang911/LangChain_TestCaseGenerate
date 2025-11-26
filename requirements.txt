@@ -1,0 +1,7 @@
+pandas
+streamlit
+langchain-core
+langchain-openai
+pydantic
+pypdf
+python-docx
