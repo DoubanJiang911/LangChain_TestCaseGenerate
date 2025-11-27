@@ -86,6 +86,19 @@ def chunk_text(text, chunk_size=1800, overlap=200):
     return chunks
 
 
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# 初始化 session state
+for key in ["feature_df", "feature_bytes", "case_df", "case_bytes"]:
+    st.session_state.setdefault(key, None)
+
+
 # ---------------------------------------------------------
 # Agent steps
 # ---------------------------------------------------------
@@ -165,14 +178,37 @@ def analyze_features(llm, text):
     return list(unique.values())
 
 
+def estimate_case_target(feature: FeatureItem, max_cases: int):
+    """
+    根据功能复杂度估算需要的测试用例数量。
+    简单启发式：基于描述长度、验收点数以及依赖个数。
+    """
+    base = 1
+    desc_len = len(feature.description.split())
+    acceptance_count = len(feature.acceptance)
+    dependency_count = len(feature.dependencies)
+
+    if desc_len > 80:
+        base += 2
+    elif desc_len > 40:
+        base += 1
+
+    base += min(acceptance_count, 3)
+    base += min(dependency_count, 2)
+
+    return max(1, min(max_cases, base))
+
+
 def generate_cases(llm, features, max_cases):
     parser = JsonOutputParser(pydantic_object=TestSuite)
     prompt = ChatPromptTemplate.from_messages([
         ("system", "你是测试架构师，根据功能定义设计测试用例，覆盖正向、异常、边界。"
                    "每条用例需要 case_id/module/feature/title/precondition/"
-                   "steps/expected/priority/type。\n{format_instructions}"),
+                   "steps/expected/priority/type。你应根据功能复杂度，生成合适数量的用例，"
+                   "但不要少于 1 条，也不要超过用户指定的上限。\n{format_instructions}"),
         ("human", "功能信息：\n{feature_payload}\n"
-                  "请输出不超过 {max_cases} 条代表性测试用例。")
+                  "请根据复杂度生成 {target_cases}~{max_cases} 条代表性用例，"
+                  "若功能简单可输出更少，但至少 1 条。")
     ])
 
     chain = prompt | llm | parser
@@ -212,8 +248,10 @@ def generate_cases(llm, features, max_cases):
         payload = feature.model_dump()
         try:
             with st.spinner(f"生成测试用例 {idx}/{len(features)}"):
+                target_cases = estimate_case_target(feature, max_cases)
                 result = chain.invoke({
                     "feature_payload": payload,
+                    "target_cases": target_cases,
                     "max_cases": max_cases,
                     "format_instructions": parser.get_format_instructions()
                 })
@@ -265,49 +303,70 @@ elif text_input.strip():
     document_text = text_input.strip()
 
 
+def render_feature_results():
+    df = st.session_state.get("feature_df")
+    data = st.session_state.get("feature_bytes")
+    if df is None:
+        return
+    st.subheader("步骤 1：功能梳理")
+    st.dataframe(df, use_container_width=True)
+    if data:
+        st.download_button(
+            "📥 下载功能清单",
+            data=data,
+            file_name="features.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_features_btn"
+        )
+
+
+def render_case_results():
+    df = st.session_state.get("case_df")
+    data = st.session_state.get("case_bytes")
+    if df is None:
+        return
+    st.subheader("步骤 2：自动生成测试用例")
+    st.dataframe(df, use_container_width=True)
+    if data:
+        st.download_button(
+            "📥 下载测试用例",
+            data=data,
+            file_name="test_cases.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_cases_btn"
+        )
+
+
 if st.button("🚀 运行 Agent 流程", type="primary"):
+    st.session_state["feature_df"] = None
+    st.session_state["feature_bytes"] = None
+    st.session_state["case_df"] = None
+    st.session_state["case_bytes"] = None
+
     if not document_text:
         st.error("请先上传文件或粘贴需求内容。")
     else:
         llm = init_llm(api_key, base_url, model_name, temperature)
         if llm:
-            st.subheader("步骤 1：功能梳理")
             features = analyze_features(llm, document_text)
 
             if not features:
                 st.error("没有提取到功能点，请检查文档内容。")
             else:
                 feature_df = pd.DataFrame([f.dict() for f in features])
-                st.dataframe(feature_df, use_container_width=True)
+                st.session_state["feature_df"] = feature_df
+                st.session_state["feature_bytes"] = df_to_excel_bytes(feature_df, "Features")
 
-                feature_out = BytesIO()
-                with pd.ExcelWriter(feature_out, engine="xlsxwriter") as writer:
-                    feature_df.to_excel(writer, index=False, sheet_name="Features")
-
-                st.download_button(
-                    "📥 下载功能清单",
-                    feature_out.getvalue(),
-                    "features.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-                st.subheader("步骤 2：自动生成测试用例")
                 cases = generate_cases(llm, features, max_cases)
 
                 if cases:
                     case_df = pd.DataFrame(cases)
-                    st.dataframe(case_df, use_container_width=True)
-
-                    case_out = BytesIO()
-                    with pd.ExcelWriter(case_out, engine="xlsxwriter") as writer:
-                        case_df.to_excel(writer, index=False, sheet_name="TestCases")
-
-                    st.download_button(
-                        "📥 下载测试用例",
-                        case_out.getvalue(),
-                        "test_cases.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                    st.session_state["case_df"] = case_df
+                    st.session_state["case_bytes"] = df_to_excel_bytes(case_df, "TestCases")
                 else:
                     st.warning("LLM 没有返回测试用例，请尝试减少文档长度或更换模型。")
+
+
+render_feature_results()
+render_case_results()
 
